@@ -86,3 +86,12 @@ class HalfSplitScheduler : public Scheduler {
     virtual void refresh_status() override;
     robin_hood::unordered_map<uint32_t, std::deque<std::unique_ptr<Tile>>> _executable_tile_queue_table;
 };
+
+class LayerSplitScheduler : public Scheduler {
+  public:
+    LayerSplitScheduler(SimulationConfig config, const cycle_type* core_cycle, const uint64_t* core_time, void* simulator);
+
+  protected:
+    virtual void issue_tile_per_core();
+    virtual void refresh_status() override;
+};
