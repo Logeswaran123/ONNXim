@@ -24,8 +24,78 @@ GemmWS::GemmWS(SimulationConfig config, Model* model, std::string name,
   has_bias = std::stoi(get_attribute("has_bias"));
 }
 
+// void GemmWS::initialize_tiles(MappingTable& mapping_table) {
+//   Mapping::LoopCounts key{.N = _output_shape[(_input_shape.size() >= 2 ? _input_shape.size()-2 : _input_shape.size()) + Ndim] * _batch_size,
+//                           .C = _weight_shape[Cdim_w],
+//                           .M = _weight_shape[Mdim],
+//                           .S = 1,
+//                           .R = 1,
+//                           .Q = 1,
+//                           .P = 1,
+//                           .target_core = target_core};
+
+//   key.N = _output_shape.size() == 1 ? 1 : key.N;
+
+//   Mapping mapping;
+//   try {
+//     mapping = mapping_table.at(key);
+//   } catch (const std::out_of_range& e) {
+//     spdlog::error("Key not found: N: {} C: {} M: {} P: {} Q: {} S: {} R: {}",
+//       key.N, key.C, key.M, key.P, key.Q, key.S, key.R);
+//     std::exit(EXIT_FAILURE);
+//   }
+//   int core_id = -1; // starts from 0
+//   for (uint32_t N = 0; N < mapping.tile_out_loop.N; N++) {
+//     for (uint32_t M = 0; M < mapping.tile_out_loop.M; M++) {
+//       for (uint32_t C = 0; C < mapping.tile_out_loop.C; C++) {
+//         if (C == 0) {
+//           core_id = (core_id + 1) % _config.num_cores;
+//           spdlog::info("core_id: {}, layer_id: {}", core_id, _id);
+//         }
+//         std::unique_ptr<Tile> tile = std::make_unique<Tile>(Tile{
+//           .status = Tile::Status::INITIALIZED,
+//           .optype = "Gemm",
+//           .layer_id = _id,
+//           .batch = N,
+//           .Q = 1,
+//           .P = 1,
+//           .M = M,
+//           .C = C,
+//           .S = 1,
+//           .R = 1,
+//           .accum = C != 0,
+//           .core_id = core_id
+//         });
+//         _tiles.push_back(std::move(tile));
+//         initialize_instructions(_tiles.back().get(), mapping);
+//         if (!_tiles.back().get()->instructions.size())
+//           _tiles.pop_back();
+//       }
+//     }
+//   }
+
+//   float total_flops = key.M / ((float) 1e3) * key.N / ((float) 1e3) * key.C / ((float) 1e3) * 2;
+//   float bias_flops = key.M / ((float) 1e3) * key.N / ((float) 1e3) / ((float) 1e3);
+//   if (has_bias) {
+//     total_flops += bias_flops;
+//   }
+//   spdlog::info("[GemmWs] Keys K = {}, N = {}, M = {}", key.C, key.N, key.M);
+//   float total_memory = (key.M * key.C + key.N * key.C + key.N * key.M) * _config.precision / ((float) 1e9);
+//   float bias_memory = key.M *_config.precision / ((float) 1e9);
+//   if (has_bias) {
+//     total_memory += bias_memory;
+//   }
+//   spdlog::info("[GemmWS]: total {} GFLOPs, {} GB", total_flops, total_memory);
+//   float theoretical_compute_time = total_flops / _config.max_systolic_flops(target_core);
+//   float theoretical_mem_time = total_memory / _config.max_dram_bandwidth();
+//   float theoretical_time = std::max(theoretical_compute_time, theoretical_mem_time);
+//   spdlog::info("[GemmWS]: Theoretical time(ms): {} Compute time: {} Memory time: {}",
+//                theoretical_time * 1e3, theoretical_compute_time * 1e3, theoretical_mem_time * 1e3);
+// }
+
+
 void GemmWS::initialize_tiles(MappingTable& mapping_table) {
-  Mapping::LoopCounts key{.N = _output_shape[_input_shape.size()-2 + Ndim] * _batch_size,
+  Mapping::LoopCounts key{.N = _output_shape[(_input_shape.size() >= 2 ? _input_shape.size()-2 : _input_shape.size()) + Ndim] * _batch_size,
                           .C = _weight_shape[Cdim_w],
                           .M = _weight_shape[Mdim],
                           .S = 1,
@@ -33,6 +103,8 @@ void GemmWS::initialize_tiles(MappingTable& mapping_table) {
                           .Q = 1,
                           .P = 1,
                           .target_core = target_core};
+
+  key.N = _output_shape.size() == 1 ? 1 : key.N;
 
   Mapping mapping;
   try {
@@ -42,13 +114,20 @@ void GemmWS::initialize_tiles(MappingTable& mapping_table) {
       key.N, key.C, key.M, key.P, key.Q, key.S, key.R);
     std::exit(EXIT_FAILURE);
   }
-  int core_id = -1; // starts from 0
+
+  int num_tiles = mapping.tile_out_loop.N * mapping.tile_out_loop.M * mapping.tile_out_loop.C;
+  int num_cores = _config.num_cores;
+
+  spdlog::info("Num Tiles: {}, Num Cores: {}", num_tiles, num_cores);
+
+  // Distribute tiles across cores
   for (uint32_t N = 0; N < mapping.tile_out_loop.N; N++) {
     for (uint32_t M = 0; M < mapping.tile_out_loop.M; M++) {
       for (uint32_t C = 0; C < mapping.tile_out_loop.C; C++) {
-        if (C == 0) {
-          core_id = (core_id + 1) % _config.num_cores;
-        }
+        // Calculate the core_id based on the tile index (N, M, C)
+        int core_id = (N * mapping.tile_out_loop.M * mapping.tile_out_loop.C + M * mapping.tile_out_loop.C + C) % num_cores;
+        spdlog::info("core_id: {}, layer_id: {}", core_id, _id);
+
         std::unique_ptr<Tile> tile = std::make_unique<Tile>(Tile{
           .status = Tile::Status::INITIALIZED,
           .optype = "Gemm",
@@ -65,11 +144,15 @@ void GemmWS::initialize_tiles(MappingTable& mapping_table) {
         });
         _tiles.push_back(std::move(tile));
         initialize_instructions(_tiles.back().get(), mapping);
-        if (!_tiles.back().get()->instructions.size())
-          _tiles.pop_back();
+
+        if (!_tiles.back()->instructions.size()) {
+          _tiles.pop_back(); // Remove tile if it has no instructions
+        }
       }
     }
   }
+
+  // Compute theoretical GFLOPs and memory usage
   float total_flops = key.M / ((float) 1e3) * key.N / ((float) 1e3) * key.C / ((float) 1e3) * 2;
   float bias_flops = key.M / ((float) 1e3) * key.N / ((float) 1e3) / ((float) 1e3);
   if (has_bias) {
@@ -77,7 +160,7 @@ void GemmWS::initialize_tiles(MappingTable& mapping_table) {
   }
   spdlog::info("[GemmWs] Keys K = {}, N = {}, M = {}", key.C, key.N, key.M);
   float total_memory = (key.M * key.C + key.N * key.C + key.N * key.M) * _config.precision / ((float) 1e9);
-  float bias_memory = key.M *_config.precision / ((float) 1e9);
+  float bias_memory = key.M * _config.precision / ((float) 1e9);
   if (has_bias) {
     total_memory += bias_memory;
   }
@@ -88,6 +171,8 @@ void GemmWS::initialize_tiles(MappingTable& mapping_table) {
   spdlog::info("[GemmWS]: Theoretical time(ms): {} Compute time: {} Memory time: {}",
                theoretical_time * 1e3, theoretical_compute_time * 1e3, theoretical_mem_time * 1e3);
 }
+
+
 
 void GemmWS::initialize_instructions(Tile* tile, Mapping mapping) {
   int tout_m_offset = tile->M * mapping.tile_in_loop.M;
