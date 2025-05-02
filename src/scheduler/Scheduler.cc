@@ -3,6 +3,7 @@
 
 std::unique_ptr<Scheduler> Scheduler::create(SimulationConfig config,
                                              const cycle_type* core_cycle, const uint64_t* core_time, void* simulator) {
+  spdlog::info("Scheduler Type Requested: {}", config.scheduler_type);
   if (config.scheduler_type == "simple") {
     return std::make_unique<Scheduler>(config, core_cycle, core_time, simulator);
   } else if (config.scheduler_type == "partition_cpu") {
@@ -13,6 +14,8 @@ std::unique_ptr<Scheduler> Scheduler::create(SimulationConfig config,
         std::make_unique<TimeMultiplexScheduler>(config, core_cycle, core_time, simulator);
   } else if (config.scheduler_type == "spatial_split") {
     return std::make_unique<HalfSplitScheduler>(config, core_cycle, core_time, simulator);
+  } else if (config.scheduler_type == "layer_split") {
+    return std::make_unique<LayerSplitScheduler>(config, core_cycle, core_time, simulator);
   } else {
     spdlog::error("[Configuration] {} is invalid scheduler type...!", config.scheduler_type);
     exit(EXIT_FAILURE);
@@ -558,5 +561,91 @@ void HalfSplitScheduler::refresh_status() {
         }
       }
     }
+  }
+}
+
+
+LayerSplitScheduler::LayerSplitScheduler(SimulationConfig config, const cycle_type* core_cycle, const uint64_t* core_time, void* simulator)
+      : Scheduler(config, core_cycle, core_time, simulator) {}
+
+void LayerSplitScheduler::issue_tile_per_core() {
+      for (auto& partition_queue : _executable_tile_queue) {
+          uint32_t partition_id = partition_queue.first;
+          auto& queue = partition_queue.second;
+
+          while (!queue.empty()) {
+              std::unique_ptr<Tile>& tile = queue.front();
+
+              if (tile->status == Tile::Status::BAR)
+                  break;
+
+              uint32_t core_id;
+              if (tile->core_id == -1) {
+                  // round-robin
+                  core_id = _core_rr_id % _config.num_cores;
+                  _core_rr_id++;
+              } else {
+                  core_id = tile->core_id;  // specified core ID
+              }
+
+              if (_cpu_to_partition[core_id] == partition_id) { // if core belongs to current partition ID
+                  _core_executable_tile_queue[core_id].push_back(std::move(tile));
+                  queue.pop_front();
+              } else {
+                  spdlog::warn("Tile with core_id {} doesn't belong to partition {}. Skipping.", core_id, partition_id);
+                  queue.push_back(std::move(queue.front()));
+                  queue.pop_front();
+              }
+          }
+      }
+  }
+
+void LayerSplitScheduler::refresh_status() {
+  Scheduler::refresh_status();
+
+  if (!_request_queue.empty()) {
+    if (_request_queue.front().model->check_finish()) {
+      spdlog::info("Model[{}] Request: {} us, Start: {} us, finish:{} us, Current Cycle:{}",
+                    _request_queue.front().model->get_name(),
+                    _request_queue.front().model->get_request_time() / 1000000,
+                    _request_queue.front().model->get_start_time() / 1000000,
+                    (*_core_time) / 1000000, *_core_cycle);
+      std::unique_ptr<Model> finished_model = std::move(_request_queue.front().model);
+      _request_queue.pop_front();
+      spdlog::info("_request_queue.size(): {}", _request_queue.size());
+    }
+  }
+
+  if (!_request_queue.empty() && tile_queue_empty() && count_active_layers() == 0) {
+      Operation* new_layer = _request_queue.front().model->get_executable_tile();
+      if (new_layer == nullptr)
+          return;
+
+      spdlog::info("Start layer {}", new_layer->get_name().c_str());
+      _request_queue.front().model->update_start_time(*_core_time);
+
+      // Distribute tiles to their corresponding partition queues based on core_id
+      for (auto& tile : new_layer->get_tiles()) {
+          uint32_t core_id = (tile->core_id == -1) ? (_core_rr_id++ % _config.num_cores) : tile->core_id;
+          uint32_t partition_id = _cpu_to_partition[core_id];
+          spdlog::info("core_id: {}, partition_id: {}", core_id, partition_id);
+          _executable_tile_queue[partition_id].push_back(std::move(tile));
+      }
+
+      new_layer->clear_tiles();
+
+      _nr_layer++;
+      _active_layers_map[new_layer->get_id()] = LayerStat{
+          .id = new_layer->get_id(),
+          .name = new_layer->get_name(),
+          .launched = true,
+          .start_cycle = *_core_cycle,
+          .total_tiles = (uint32_t)new_layer->get_tiles().size(),
+          .remain_tiles = (uint32_t)new_layer->get_tiles().size(),
+          .finished_tiles = 0,
+          .launched_tiles = 0
+      };
+
+      issue_tile_per_core();
   }
 }
